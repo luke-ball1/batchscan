@@ -1,312 +1,365 @@
-/**
- * CRATE TRACKING SYSTEM — Company Bakery (v2: physical crate tags)
- * ----------------------------------------------------------
- * Each physical crate gets ONE permanent QR sticker, generated once in a
- * batch and printed. The sticker's ID never changes for the life of the
- * crate. Route/customer are NOT tied to the crate — they're captured at
- * the moment a crate is scanned OUT, and every later event (DELIVERED, IN)
- * automatically inherits that same route/customer until the next OUT.
- *
- * TABS (created by setup()):
- *   Registry    - one row per physical crate ID ever generated
- *   Ledger      - one row per scan event (append-only log)
- *   Dashboard   - computed summary, refreshed on demand
- *   PrintQueue  - holds the most recently generated batch, read by the
- *                 print sheet
- *
- * DEPLOY AS WEB APP (Deploy > New deployment > Web app, execute as Me,
- * access Anyone with the link / your domain):
- *   Scan page:   <url>/exec?role=driver   (or packer / ops)
- *   Print sheet: <url>/exec?mode=print
- * ----------------------------------------------------------
- */
-
-const SHEET_NAMES = {
-  REGISTRY: 'Registry',
-  LEDGER: 'Ledger',
-  DASHBOARD: 'Dashboard',
-  PRINT_QUEUE: 'PrintQueue'
-};
-
-const EVENT_TYPES = ['OUT', 'DELIVERED', 'IN', 'ISSUE'];
-
-// Fixed route list shown as a dropdown when scanning a crate OUT.
-// Edit this list as your routes change.
-const FIXED_ROUTES = ['M1', 'M2', 'M3', 'M4', 'M5', 'N1', 'N2', 'N3', 'SANDWICH', 'BMB', 'INTERNAL', 'COLLECT'];
-
-// ---------- SETUP ----------
-
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Crate Tracking')
-    .addItem('Run setup (first time only)', 'setup')
-    .addItem('Generate new crate batch...', 'promptGenerateBatch')
-    .addItem('Refresh dashboard', 'refreshDashboard')
-    .addToUi();
-}
-
-function setup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  const registry = getOrCreateSheet_(ss, SHEET_NAMES.REGISTRY);
-  if (registry.getLastRow() === 0) {
-    registry.appendRow(['Crate ID', 'Date Created', 'Status', 'Notes']);
-    registry.setFrozenRows(1);
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crate Batch Scanner</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Roboto, Arial, sans-serif;
+    margin: 0; padding: 16px;
+    background: #f7f5f2; color: #2b2620;
   }
-
-  const ledger = getOrCreateSheet_(ss, SHEET_NAMES.LEDGER);
-  if (ledger.getLastRow() === 0) {
-    ledger.appendRow(['Timestamp', 'Crate ID', 'Event Type', 'Route', 'Customer', 'Scanned By', 'Notes']);
-    ledger.setFrozenRows(1);
+  h1 { font-size: 18px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .role-pill { font-size: 12px; background: #e6e1d8; color: #555; padding: 3px 10px; border-radius: 10px; cursor: pointer; }
+  .card { background: white; border-radius: 10px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  label { display: block; font-size: 13px; color: #555; margin: 10px 0 4px; }
+  select, input[type=text] { width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #ccc; }
+  button {
+    width: 100%; padding: 16px; font-size: 17px; font-weight: 600;
+    border: none; border-radius: 10px; margin-top: 12px; color: white; cursor: pointer;
   }
+  .btn-out { background: #2f6fed; }
+  .btn-delivered { background: #2fa84f; }
+  .btn-in { background: #7a4fd6; }
+  .btn-issue { background: #d64545; }
+  .btn-secondary { background: #ddd8d0; color: #333; }
+  #reader { width: 100%; border-radius: 10px; overflow: hidden; margin-bottom: 12px; }
+  #status { padding: 10px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; display: none; }
+  #status.ok { background: #dff3e2; color: #1e6b30; display: block; }
+  #status.err { background: #fbe3e3; color: #a12a2a; display: block; }
+  #status.pending { background: #fff3d6; color: #8a6300; display: block; }
+  #liveLog { max-height: 220px; overflow-y: auto; }
+  #liveLog .row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; font-size: 14px; }
+  #liveLog .row .id { font-weight: 700; }
+  #liveLog .row .tag { font-size: 11px; padding: 2px 8px; border-radius: 8px; color: white; }
+  .tag-OUT { background: #2f6fed; }
+  .tag-DELIVERED { background: #2fa84f; }
+  .tag-IN { background: #7a4fd6; }
+  .tag-ISSUE { background: #d64545; }
+  #batchCount { font-size: 14px; color: #555; margin-bottom: 8px; }
+  #queueBadge { display: inline-block; background: #e0651b; color: white; font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+</style>
+</head>
+<body>
 
-  const dashboard = getOrCreateSheet_(ss, SHEET_NAMES.DASHBOARD);
-  dashboard.clear();
-  dashboard.appendRow(['Crate ID', 'Status', 'Last Event', 'Route', 'Customer', 'Last Event Time', 'Days Since', 'Trip Count', 'Flag']);
-  dashboard.setFrozenRows(1);
+<h1>Crate Batch Scanner
+  <span class="role-pill" id="rolePill" onclick="chooseRole()"></span>
+  <span id="queueBadge" style="display:none;"></span>
+</h1>
 
-  const printQueue = getOrCreateSheet_(ss, SHEET_NAMES.PRINT_QUEUE);
-  if (printQueue.getLastRow() === 0) {
-    printQueue.appendRow(['Crate ID']);
-    printQueue.setFrozenRows(1);
-  }
+<div id="status"></div>
 
-  SpreadsheetApp.getUi().alert('Setup complete. Registry, Ledger, Dashboard and PrintQueue tabs are ready.');
-}
+<!-- Step 1: who's scanning -->
+<div id="roleChooser" class="card" style="display:none;">
+  <div>Who's scanning on this device?</div>
+  <button class="btn-out" onclick="setRole('packer')">Packer</button>
+  <button class="btn-delivered" onclick="setRole('driver')">Driver</button>
+  <button class="btn-secondary" onclick="setRole('ops')">Ops (all actions)</button>
+</div>
 
-function getOrCreateSheet_(ss, name) {
-  let sheet = ss.getSheetByName(name);
-  if (!sheet) sheet = ss.insertSheet(name);
-  return sheet;
-}
+<!-- Step 2: set up the batch (action type, and for OUT: route/customer) -->
+<div id="setupCard" class="card" style="display:none;">
+  <div id="actionPicker"></div>
+</div>
 
-// ---------- CRATE BATCH GENERATION (physical stickers) ----------
+<!-- Step 3: live continuous scanning -->
+<div id="scanCard" style="display:none;">
+  <div id="batchCount"></div>
+  <div id="reader"></div>
+  <div class="card">
+    <label>Or type a crate ID manually</label>
+    <input type="text" id="manualId" placeholder="e.g. CB-0001">
+    <button class="btn-secondary" onclick="handleManualEntry()">Add</button>
+    <div id="liveLog"></div>
+    <button class="btn-secondary" onclick="finishBatch()">Finish batch</button>
+  </div>
+</div>
 
-function promptGenerateBatch() {
-  const ui = SpreadsheetApp.getUi();
-  const countResp = ui.prompt('Generate crate batch', 'How many new crate IDs do you want to generate?', ui.ButtonSet.OK_CANCEL);
-  if (countResp.getSelectedButton() !== ui.Button.OK) return;
-  const count = parseInt(countResp.getResponseText(), 10);
-  if (!count || count <= 0) {
-    ui.alert('Enter a valid number.');
-    return;
-  }
-  const ids = generateCrateBatch(count);
-  ui.alert('Generated ' + ids.length + ' crate IDs (' + ids[0] + ' to ' + ids[ids.length - 1] + ').\n\n'
-    + 'Open the web app with ?mode=print to print the sticker sheet for this batch.');
-}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+<script>
+  // ============================================================
+  // SET THIS to your deployed Apps Script web app /exec URL
+  // ============================================================
+  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxeVI6CeuXQwoA4m3oGrf5jCW1hXTjQZ-o8L25EsJU1EUpfZVTfW2XqNIW5hkaHWAxsMQ/exec";
 
-/**
- * Creates `count` new sequential crate IDs (e.g. CB-0001, CB-0002, ...),
- * continuing from the highest existing number in the Registry. Writes them
- * to Registry (Status = Active) and overwrites PrintQueue with just this
- * batch, ready for the print sheet to pick up.
- */
-function generateCrateBatch(count, prefix) {
-  prefix = prefix || 'CB';
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const registry = getOrCreateSheet_(ss, SHEET_NAMES.REGISTRY);
-
-  const existingIds = registry.getLastRow() > 1
-    ? registry.getRange(2, 1, registry.getLastRow() - 1, 1).getValues().flat()
-    : [];
-  let maxNum = 0;
-  existingIds.forEach(id => {
-    const match = String(id).match(new RegExp('^' + prefix + '-(\\d+)$'));
-    if (match) maxNum = Math.max(maxNum, parseInt(match[1], 10));
-  });
-
-  const now = new Date();
-  const newRows = [];
-  const newIds = [];
-  for (let i = 1; i <= count; i++) {
-    const num = maxNum + i;
-    const id = prefix + '-' + String(num).padStart(4, '0');
-    newIds.push(id);
-    newRows.push([id, now, 'Active', '']);
-  }
-
-  registry.getRange(registry.getLastRow() + 1, 1, newRows.length, 4).setValues(newRows);
-
-  // Overwrite PrintQueue with just this batch
-  const printQueue = getOrCreateSheet_(ss, SHEET_NAMES.PRINT_QUEUE);
-  printQueue.clear();
-  printQueue.appendRow(['Crate ID']);
-  printQueue.getRange(2, 1, newIds.length, 1).setValues(newIds.map(id => [id]));
-
-  return newIds;
-}
-
-function getPrintQueue() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const printQueue = getOrCreateSheet_(ss, SHEET_NAMES.PRINT_QUEUE);
-  if (printQueue.getLastRow() <= 1) return [];
-  return printQueue.getRange(2, 1, printQueue.getLastRow() - 1, 1).getValues().flat();
-}
-
-// ---------- WEB APP ----------
-
-function doGet(e) {
-  const params = (e && e.parameter) || {};
-
-  // --- JSON API for the externally-hosted batch scanner ---
-  // Using GET for writes too (not just reads) deliberately: Apps Script web
-  // apps respond via a redirect, and several browsers silently downgrade a
-  // POST to a GET when following it, which would make doPost never actually
-  // run. GET has no such issue, so everything goes through here instead.
-  if (params.action === 'crateInfo') {
-    return jsonResponse_(getCrateInfo(params.crateId));
-  }
-  if (params.action === 'customers') {
-    return jsonResponse_(getDistinctCustomers());
-  }
-  if (params.action === 'logScan') {
-    return jsonResponse_(logScan(params.crateId, params.eventType, params.scannedBy, params.route, params.customer, params.notes));
-  }
-
-  const mode = params.mode || 'scan';
-  if (mode === 'print') {
-    return HtmlService.createHtmlOutputFromFile('PrintSheet')
-      .setTitle('Crate Sticker Sheet');
-  }
-
-  const template = HtmlService.createTemplateFromFile('ScanApp');
-  template.crateId = params.crateId || '';
-  template.routesJson = JSON.stringify(FIXED_ROUTES);
-  return template.evaluate()
-    .setTitle('Crate Scan — Company Bakery')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
-}
-
-function jsonResponse_(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
-}
-
-// ---------- SERVER FUNCTIONS CALLED FROM ScanApp.html ----------
-
-/**
- * Returns whether a crate ID is a registered physical crate, plus its
- * current "assignment" (route/customer from its most recent OUT/DELIVERED
- * event) so the scan page can show context without asking the person to
- * re-enter it.
- */
-function getCrateInfo(crateId) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const registry = getOrCreateSheet_(ss, SHEET_NAMES.REGISTRY);
-  const regData = registry.getDataRange().getValues();
-  const isRegistered = regData.slice(1).some(row => row[0] === crateId);
-
-  const ledger = getOrCreateSheet_(ss, SHEET_NAMES.LEDGER);
-  const ledgerData = ledger.getDataRange().getValues().slice(1);
-  const crateEvents = ledgerData.filter(row => row[1] === crateId);
-  crateEvents.sort((a, b) => new Date(b[0]) - new Date(a[0]));
-  const last = crateEvents[0];
-
-  return {
-    registered: isRegistered,
-    crateId: crateId,
-    lastEvent: last ? last[2] : null,
-    route: last ? last[3] : '',
-    customer: last ? last[4] : '',
-    lastEventTime: last ? last[0] : null
+  const ROLE_KEY = 'crateScanRole';
+  const QUEUE_KEY = 'crateScanOfflineQueue';
+  const ROLE_ACTIONS = {
+    packer: ['OUT'],
+    driver: ['DELIVERED', 'IN', 'ISSUE'],
+    ops: ['OUT', 'DELIVERED', 'IN', 'ISSUE']
   };
-}
+  const ACTION_META = {
+    OUT: { label: 'Scan crates OUT', cls: 'btn-out' },
+    DELIVERED: { label: 'Scan crates DELIVERED', cls: 'btn-delivered' },
+    IN: { label: 'Scan crates IN (returned)', cls: 'btn-in' },
+    ISSUE: { label: 'Flag crates with an issue', cls: 'btn-issue' }
+  };
+  const FIXED_ROUTES = ['M1','M2','M3','M4','M5','N1','N2','N3','SANDWICH','BMB','INTERNAL','COLLECT'];
 
-function getDistinctCustomers() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ledger = getOrCreateSheet_(ss, SHEET_NAMES.LEDGER);
-  if (ledger.getLastRow() <= 1) return [];
-  const customers = ledger.getRange(2, 5, ledger.getLastRow() - 1, 1).getValues().flat().filter(String);
-  return [...new Set(customers)].sort();
-}
+  let scanner = null;
+  let currentBatch = null; // { eventType, route, customer, scannedBy, count, recentlyScanned: Map }
+  let knownCustomers = [];
 
-/**
- * Logs a scan event.
- * - For OUT: route/customer are required (that's the point at which the
- *   assignment is decided).
- * - For DELIVERED/IN/ISSUE: route/customer are looked up automatically
- *   from the crate's most recent event, so the caller can pass empty
- *   strings for those.
- */
-function logScan(crateId, eventType, scannedBy, route, customer, notes) {
-  if (EVENT_TYPES.indexOf(eventType) === -1) {
-    throw new Error('Unknown event type: ' + eventType);
+  // ---------- role ----------
+  function getRole() { return localStorage.getItem(ROLE_KEY) || ''; }
+  function setRole(role) {
+    localStorage.setItem(ROLE_KEY, role);
+    document.getElementById('roleChooser').style.display = 'none';
+    updateRolePill();
+    showActionPicker();
+  }
+  function chooseRole() {
+    stopScanner();
+    document.getElementById('scanCard').style.display = 'none';
+    document.getElementById('setupCard').style.display = 'none';
+    document.getElementById('roleChooser').style.display = 'block';
+  }
+  function updateRolePill() {
+    const r = getRole();
+    document.getElementById('rolePill').textContent = r ? ('(' + r + ' — tap to change)') : '(set role)';
   }
 
-  let finalRoute = route;
-  let finalCustomer = customer;
-  if (eventType !== 'OUT') {
-    const info = getCrateInfo(crateId);
-    finalRoute = info.route;
-    finalCustomer = info.customer;
+  // ---------- offline queue ----------
+  function getQueue() { try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); } catch (e) { return []; } }
+  function saveQueue(q) { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); updateQueueBadge(); }
+  function updateQueueBadge() {
+    const n = getQueue().length;
+    const badge = document.getElementById('queueBadge');
+    if (n > 0) { badge.style.display = 'inline-block'; badge.textContent = n + ' queued'; }
+    else { badge.style.display = 'none'; }
+  }
+  function flushQueue() {
+    const q = getQueue();
+    if (!q.length) return;
+    // Send one at a time via GET; keep whatever fails (e.g. still offline) queued for next time
+    const remaining = [];
+    let chain = Promise.resolve();
+    q.forEach(event => {
+      chain = chain
+        .then(() => apiLogScan(event))
+        .catch(() => { remaining.push(event); });
+    });
+    chain.then(() => saveQueue(remaining));
+  }
+  window.addEventListener('online', flushQueue);
+
+  // ---------- API calls ----------
+  // Deliberately GET-only, including for writes: Apps Script web apps respond
+  // via a redirect, and several browsers downgrade a POST to GET when
+  // following it - which would silently mean scans never actually save.
+  // GET has no such issue.
+  function apiGet(params) {
+    const qs = new URLSearchParams(params).toString();
+    return fetch(APPS_SCRIPT_URL + '?' + qs).then(r => r.json());
+  }
+  function apiLogScan(event) {
+    return apiGet({
+      action: 'logScan',
+      crateId: event.crateId,
+      eventType: event.eventType,
+      scannedBy: event.scannedBy,
+      route: event.route || '',
+      customer: event.customer || '',
+      notes: event.notes || ''
+    });
   }
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ledger = getOrCreateSheet_(ss, SHEET_NAMES.LEDGER);
-  ledger.appendRow([new Date(), crateId, eventType, finalRoute || '', finalCustomer || '', scannedBy || '', notes || '']);
+  // ---------- setup screen ----------
+  function showActionPicker() {
+    document.getElementById('setupCard').style.display = 'block';
+    document.getElementById('scanCard').style.display = 'none';
+    const role = getRole() || 'ops';
+    const actions = ROLE_ACTIONS[role] || ROLE_ACTIONS.ops;
+    const area = document.getElementById('actionPicker');
+    area.innerHTML = '<div>What are you scanning right now?</div>';
 
-  return { success: true, crateId, route: finalRoute, customer: finalCustomer };
-}
+    actions.forEach(actionType => {
+      const meta = ACTION_META[actionType];
+      const btn = document.createElement('button');
+      btn.className = meta.cls;
+      btn.textContent = meta.label;
+      btn.onclick = () => (actionType === 'OUT') ? showOutSetupForm() : startBatch(actionType, '', '');
+      area.appendChild(btn);
+    });
+  }
 
-function logScanBatch(events) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ledger = getOrCreateSheet_(ss, SHEET_NAMES.LEDGER);
-  const rows = events.map(evt => {
-    let route = evt.route, customer = evt.customer;
-    if (evt.eventType !== 'OUT') {
-      const info = getCrateInfo(evt.crateId);
-      route = info.route;
-      customer = info.customer;
+  function showOutSetupForm() {
+    const area = document.getElementById('actionPicker');
+    area.innerHTML = '';
+
+    const routeLabel = document.createElement('label');
+    routeLabel.textContent = 'Route for this batch';
+    area.appendChild(routeLabel);
+    const routeSelect = document.createElement('select');
+    FIXED_ROUTES.forEach(r => {
+      const opt = document.createElement('option'); opt.value = r; opt.textContent = r;
+      routeSelect.appendChild(opt);
+    });
+    area.appendChild(routeSelect);
+
+    const custLabel = document.createElement('label');
+    custLabel.textContent = 'Customer for this batch';
+    area.appendChild(custLabel);
+    const custInput = document.createElement('input');
+    custInput.type = 'text';
+    custInput.setAttribute('list', 'customerList');
+    custInput.placeholder = 'Type or pick a customer';
+    area.appendChild(custInput);
+    const datalist = document.createElement('datalist');
+    datalist.id = 'customerList';
+    knownCustomers.forEach(c => { const o = document.createElement('option'); o.value = c; datalist.appendChild(o); });
+    area.appendChild(datalist);
+
+    const btn = document.createElement('button');
+    btn.className = 'btn-out';
+    btn.textContent = 'Start scanning';
+    btn.onclick = () => {
+      const customer = custInput.value.trim();
+      if (!customer) { alert('Enter a customer name.'); return; }
+      startBatch('OUT', routeSelect.value, customer);
+    };
+    area.appendChild(btn);
+
+    const back = document.createElement('button');
+    back.className = 'btn-secondary';
+    back.textContent = 'Back';
+    back.onclick = showActionPicker;
+    area.appendChild(back);
+  }
+
+  // ---------- batch scanning ----------
+  function startBatch(eventType, route, customer) {
+    currentBatch = {
+      eventType, route, customer,
+      scannedBy: sessionStorage.getItem('scannerName') || promptForName(),
+      count: 0,
+      recentlyScanned: new Map() // crateId -> timestamp, to debounce repeat reads of the same sticker
+    };
+    document.getElementById('setupCard').style.display = 'none';
+    document.getElementById('scanCard').style.display = 'block';
+    document.getElementById('liveLog').innerHTML = '';
+    updateBatchCount();
+    startScanner();
+  }
+
+  function promptForName() {
+    const name = prompt('Your name?') || 'unknown';
+    sessionStorage.setItem('scannerName', name);
+    return name;
+  }
+
+  function updateBatchCount() {
+    const meta = ACTION_META[currentBatch.eventType];
+    let context = '';
+    if (currentBatch.eventType === 'OUT') context = ' — ' + currentBatch.route + ' / ' + currentBatch.customer;
+    document.getElementById('batchCount').textContent =
+      meta.label + context + ' — ' + currentBatch.count + ' scanned this batch';
+  }
+
+  function startScanner() {
+    showStatus('pending', 'Starting camera…');
+    scanner = new Html5Qrcode("reader");
+    Html5Qrcode.getCameras().then(cameras => {
+      if (!cameras || !cameras.length) throw { message: 'No camera found' };
+      const back = cameras.find(c => /back|rear|environment/i.test(c.label));
+      const cameraId = (back || cameras[cameras.length - 1] || cameras[0]).id;
+      return scanner.start(cameraId, { fps: 10, qrbox: 220 }, onScanSuccess);
+    })
+      .then(() => hideStatus())
+      .catch(err => {
+        showStatus('err', 'Camera error: ' + (err && err.message ? err.message : 'unknown') + ' — use manual entry below.');
+      });
+  }
+
+  function stopScanner() {
+    if (scanner) {
+      scanner.stop().catch(() => {});
+      scanner = null;
     }
-    return [new Date(evt.timestamp), evt.crateId, evt.eventType, route || '', customer || '', evt.scannedBy || '', evt.notes || ''];
-  });
-  if (rows.length) {
-    ledger.getRange(ledger.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
   }
-  return { success: true, count: rows.length };
-}
 
-// ---------- DASHBOARD ----------
-
-function refreshDashboard() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const registry = getOrCreateSheet_(ss, SHEET_NAMES.REGISTRY);
-  const ledger = getOrCreateSheet_(ss, SHEET_NAMES.LEDGER);
-  const dashboard = getOrCreateSheet_(ss, SHEET_NAMES.DASHBOARD);
-
-  const regData = registry.getDataRange().getValues().slice(1);
-  const ledgerData = ledger.getDataRange().getValues().slice(1);
-
-  const eventsByCrate = {};
-  ledgerData.forEach(row => {
-    const crateId = row[1];
-    if (!eventsByCrate[crateId]) eventsByCrate[crateId] = [];
-    eventsByCrate[crateId].push(row);
-  });
-
-  const now = new Date();
-  const outRows = regData.map(row => {
-    const [crateId, , status] = row;
-    const events = (eventsByCrate[crateId] || []).slice().sort((a, b) => new Date(b[0]) - new Date(a[0]));
-    const last = events[0];
-    const tripCount = events.filter(e => e[2] === 'OUT').length;
-
-    if (!last) {
-      return [crateId, status, '(no scans yet)', '', '', '', '', tripCount, ''];
-    }
-    const daysSince = Math.floor((now - new Date(last[0])) / (1000 * 60 * 60 * 24));
-    let flag = '';
-    if (last[2] === 'ISSUE') flag = 'FLAGGED';
-    else if (last[2] === 'OUT' && daysSince >= 1) flag = 'STUCK IN TRANSIT';
-    else if (last[2] === 'DELIVERED' && daysSince >= 3) flag = 'OVERDUE RETURN';
-
-    return [crateId, status, last[2], last[3], last[4], last[0], daysSince, tripCount, flag];
-  });
-
-  dashboard.clear();
-  dashboard.appendRow(['Crate ID', 'Status', 'Last Event', 'Route', 'Customer', 'Last Event Time', 'Days Since', 'Trip Count', 'Flag']);
-  if (outRows.length) {
-    dashboard.getRange(2, 1, outRows.length, 9).setValues(outRows);
+  function onScanSuccess(decodedText) {
+    handleCrateId(decodedText.trim());
   }
-  dashboard.setFrozenRows(1);
-}
+
+  function handleManualEntry() {
+    const val = document.getElementById('manualId').value.trim();
+    if (val) handleCrateId(val);
+    document.getElementById('manualId').value = '';
+  }
+
+  function handleCrateId(crateId) {
+    if (!currentBatch) return;
+    const now = Date.now();
+    const last = currentBatch.recentlyScanned.get(crateId);
+    if (last && (now - last) < 4000) return; // debounce: ignore the same sticker re-read within 4s
+    currentBatch.recentlyScanned.set(crateId, now);
+
+    const event = {
+      crateId,
+      eventType: currentBatch.eventType,
+      route: currentBatch.route,
+      customer: currentBatch.customer,
+      scannedBy: currentBatch.scannedBy,
+      notes: '',
+      timestamp: Date.now()
+    };
+
+    currentBatch.count++;
+    updateBatchCount();
+    addLogRow(crateId, currentBatch.eventType, 'pending');
+
+    apiLogScan(event)
+      .then(res => updateLogRow(crateId, res && res.success ? 'ok' : 'err'))
+      .catch(() => {
+        const q = getQueue();
+        q.push(event);
+        saveQueue(q);
+        updateLogRow(crateId, 'queued');
+      });
+  }
+
+  function addLogRow(crateId, eventType, state) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.id = 'log-' + crateId.replace(/[^a-zA-Z0-9]/g, '_') + '-' + Date.now();
+    row.dataset.crate = crateId;
+    row.innerHTML = '<span class="id">' + crateId + '</span><span class="tag tag-' + eventType + '">' + stateLabel(state) + '</span>';
+    document.getElementById('liveLog').prepend(row);
+  }
+  function updateLogRow(crateId, state) {
+    const rows = document.querySelectorAll('#liveLog .row[data-crate="' + crateId + '"]');
+    if (rows.length) rows[0].querySelector('.tag').textContent = stateLabel(state);
+  }
+  function stateLabel(state) {
+    return state === 'ok' ? 'Logged' : state === 'queued' ? 'Queued (offline)' : state === 'err' ? 'Failed' : 'Logging…';
+  }
+
+  function finishBatch() {
+    stopScanner();
+    currentBatch = null;
+    showActionPicker();
+  }
+
+  function showStatus(kind, msg) {
+    const el = document.getElementById('status');
+    el.className = kind; el.textContent = msg;
+  }
+  function hideStatus() {
+    const el = document.getElementById('status');
+    el.className = ''; el.textContent = '';
+  }
+
+  // ---------- init ----------
+  apiGet({ action: 'customers' }).then(list => { knownCustomers = list || []; }).catch(() => {});
+  updateQueueBadge();
+  flushQueue();
+  updateRolePill();
+  if (!getRole()) chooseRole();
+  else showActionPicker();
+</script>
+</body>
+</html>
