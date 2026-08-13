@@ -124,6 +124,15 @@
   };
   const FIXED_ROUTES = ['M1','M2','M3','M4','M5','N1','N2','N3','SANDWICH','BMB','INTERNAL','COLLECT'];
 
+  // Manifest RoundName values look like "N3 - Eii." (code + area suffix),
+  // but the dropdown just has "N3". Compare on the leading code only.
+  function routeCode(routeStr) {
+    return (routeStr || '').split(/[\s-]+/)[0].toUpperCase();
+  }
+  function routesMatch(a, b) {
+    return routeCode(a) === routeCode(b);
+  }
+
   let scanner = null;
   let torchOn = false;
   let selectedRoute = '';
@@ -243,7 +252,7 @@
     const parts = text.split('|');
     const stopRoute = parts[1] || '';
     const stopCustomer = parts[2] || '';
-    if (stopRoute !== selectedRoute) {
+    if (!routesMatch(stopRoute, selectedRoute)) {
       showStatus('err', 'This marker is for route ' + stopRoute + ', but you selected ' + selectedRoute + '.');
       return;
     }
@@ -332,7 +341,7 @@
       const parts = crateId.split('|');
       const stopRoute = parts[1] || '';
       const stopCustomer = parts[2] || '';
-      if (stopRoute !== currentBatch.route) {
+      if (!routesMatch(stopRoute, currentBatch.route)) {
         showStatus('err', 'This marker is for route ' + stopRoute + ', but this batch is route ' + currentBatch.route + '.');
         return;
       }
