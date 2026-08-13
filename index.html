@@ -48,8 +48,16 @@
 
 <h1>Crate Batch Scanner
   <span class="role-pill" id="rolePill" onclick="chooseRole()"></span>
-  <span id="queueBadge" style="display:none;"></span>
+  <span id="queueBadge" style="display:none; cursor:pointer;" onclick="showQueueViewer()"></span>
 </h1>
+
+<!-- Queued scans viewer -->
+<div id="queueViewer" class="card" style="display:none;">
+  <div style="font-weight:600; margin-bottom:8px;">Queued scans (not yet synced)</div>
+  <div id="queueList" style="max-height:260px; overflow-y:auto; font-size:14px;"></div>
+  <button class="btn-secondary" onclick="hideQueueViewer()">Close</button>
+  <button class="btn-issue" id="clearQueueBtn" onclick="clearQueuePrompt()">Clear all queued scans</button>
+</div>
 
 <div id="status"></div>
 
@@ -154,7 +162,7 @@
   }
   function updateRolePill() {
     const r = getRole();
-    document.getElementById('rolePill').textContent = r ? ('(' + r + ' — tap to change)') : '(set role)';
+    document.getElementById('rolePill').textContent = r ? ('(' + r + ' — tap to change)') : '(all actions — tap to restrict)';
   }
 
   function hideAllCards() {
@@ -169,8 +177,43 @@
   function updateQueueBadge() {
     const n = getQueue().length;
     const badge = document.getElementById('queueBadge');
-    if (n > 0) { badge.style.display = 'inline-block'; badge.textContent = n + ' queued'; }
-    else { badge.style.display = 'none'; }
+    if (n > 0) { badge.style.display = 'inline-block'; badge.textContent = n + ' queued (tap to view)'; }
+    else { badge.style.display = 'none'; hideQueueViewer(); }
+  }
+
+  function showQueueViewer() {
+    const q = getQueue();
+    const list = document.getElementById('queueList');
+    if (!q.length) {
+      list.innerHTML = '<div style="color:#777;">Nothing queued.</div>';
+    } else {
+      list.innerHTML = q.map(evt => {
+        const when = new Date(evt.timestamp).toLocaleString();
+        const context = evt.eventType === 'OUT'
+          ? (evt.route || '') + (evt.customer ? ' — ' + evt.customer : '')
+          : (evt.customer || evt.route || '');
+        return '<div style="padding:6px 0; border-bottom:1px solid #eee;">'
+          + '<b>' + evt.crateId + '</b> — ' + evt.eventType
+          + (context ? ' — ' + context : '')
+          + '<br><span style="color:#888; font-size:12px;">' + when + ' — by ' + (evt.scannedBy || 'unknown') + '</span>'
+          + '</div>';
+      }).join('');
+    }
+    document.getElementById('clearQueueBtn').style.display = q.length ? 'block' : 'none';
+    document.getElementById('queueViewer').style.display = 'block';
+  }
+
+  function hideQueueViewer() {
+    document.getElementById('queueViewer').style.display = 'none';
+  }
+
+  function clearQueuePrompt() {
+    const n = getQueue().length;
+    if (!n) return;
+    if (confirm('Discard ' + n + ' queued scan(s) that haven\'t synced yet? This cannot be undone.')) {
+      saveQueue([]);
+      hideQueueViewer();
+    }
   }
   function flushQueue() {
     const q = getQueue();
@@ -474,8 +517,7 @@
   updateQueueBadge();
   flushQueue();
   updateRolePill();
-  if (!getRole()) chooseRole();
-  else showRouteCard();
+  showRouteCard();
 </script>
 </body>
 </html>
