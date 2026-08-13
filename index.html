@@ -14,6 +14,8 @@
   h1 { font-size: 18px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
   .role-pill { font-size: 12px; background: #e6e1d8; color: #555; padding: 3px 10px; border-radius: 10px; cursor: pointer; }
   .card { background: white; border-radius: 10px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .breadcrumb { font-size: 13px; color: #777; margin-bottom: 8px; }
+  .breadcrumb .step { cursor: pointer; text-decoration: underline; }
   label { display: block; font-size: 13px; color: #555; margin: 10px 0 4px; }
   select, input[type=text] { width: 100%; padding: 12px; font-size: 16px; border-radius: 8px; border: 1px solid #ccc; }
   button {
@@ -25,7 +27,7 @@
   .btn-in { background: #7a4fd6; }
   .btn-issue { background: #d64545; }
   .btn-secondary { background: #ddd8d0; color: #333; }
-  #reader { width: 100%; border-radius: 10px; overflow: hidden; margin-bottom: 12px; }
+  #reader, #reader2 { width: 100%; border-radius: 10px; overflow: hidden; margin-bottom: 12px; }
   #status { padding: 10px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; display: none; }
   #status.ok { background: #dff3e2; color: #1e6b30; display: block; }
   #status.err { background: #fbe3e3; color: #a12a2a; display: block; }
@@ -51,7 +53,7 @@
 
 <div id="status"></div>
 
-<!-- Step 1: who's scanning -->
+<!-- Step 0: who's scanning -->
 <div id="roleChooser" class="card" style="display:none;">
   <div>Who's scanning on this device?</div>
   <button class="btn-out" onclick="setRole('packer')">Packer</button>
@@ -59,21 +61,44 @@
   <button class="btn-secondary" onclick="setRole('ops')">Ops (all actions)</button>
 </div>
 
-<!-- Step 2: set up the batch (action type, and for OUT: route/customer) -->
-<div id="setupCard" class="card" style="display:none;">
-  <div id="actionPicker"></div>
+<!-- Step 1: ROUTE -->
+<div id="routeCard" class="card" style="display:none;">
+  <label>Route</label>
+  <select id="routeSelect"></select>
+  <button class="btn-out" onclick="chooseRoute()">Continue</button>
 </div>
 
-<!-- Step 3: live continuous scanning -->
-<div id="scanCard" style="display:none;">
-  <div id="batchCount"></div>
+<!-- Step 2: STOP (customer) -->
+<div id="stopCard" style="display:none;">
+  <div class="breadcrumb"><span class="step" onclick="showRouteCard()">&larr; Change route</span> — Route <b id="stopRouteLabel"></b></div>
   <div id="reader"></div>
+  <button class="btn-secondary" id="flashBtnStop" onclick="toggleTorch()" style="display:none;">Turn flash on</button>
+  <div class="card">
+    <div>Scan the stop marker on the manifest, or pick/type the customer:</div>
+    <input type="text" id="stopCustomerInput" list="stopCustomerList" placeholder="Customer name">
+    <datalist id="stopCustomerList"></datalist>
+    <button class="btn-out" onclick="chooseStop()">Continue</button>
+  </div>
+</div>
+
+<!-- Step 3: ACTION -->
+<div id="actionCard" class="card" style="display:none;">
+  <div class="breadcrumb"><span class="step" onclick="showStopCard()">&larr; Change stop</span> — Route <b id="actionRouteLabel"></b> — <b id="actionStopLabel"></b></div>
+  <div id="actionButtons"></div>
+</div>
+
+<!-- Step 4: scanning crates -->
+<div id="scanCard" style="display:none;">
+  <div class="breadcrumb"><span class="step" onclick="finishBatch()">&larr; Change stop</span></div>
+  <div id="batchCount"></div>
+  <div id="reader2"></div>
+  <button class="btn-secondary" id="flashBtnScan" onclick="toggleTorch()" style="display:none;">Turn flash on</button>
   <div class="card">
     <label>Or type a crate ID manually</label>
     <input type="text" id="manualId" placeholder="e.g. CB-0001">
     <button class="btn-secondary" onclick="handleManualEntry()">Add</button>
     <div id="liveLog"></div>
-    <button class="btn-secondary" onclick="finishBatch()">Finish batch</button>
+    <button class="btn-secondary" onclick="finishBatch()">Finish / next stop</button>
   </div>
 </div>
 
@@ -92,16 +117,18 @@
     ops: ['OUT', 'DELIVERED', 'IN', 'ISSUE']
   };
   const ACTION_META = {
-    OUT: { label: 'Scan crates OUT', cls: 'btn-out' },
-    DELIVERED: { label: 'Scan crates DELIVERED', cls: 'btn-delivered' },
-    IN: { label: 'Scan crates IN (returned)', cls: 'btn-in' },
-    ISSUE: { label: 'Flag crates with an issue', cls: 'btn-issue' }
+    OUT: { label: 'OUT', cls: 'btn-out' },
+    DELIVERED: { label: 'DELIVERED', cls: 'btn-delivered' },
+    IN: { label: 'IN (returned)', cls: 'btn-in' },
+    ISSUE: { label: 'Flag an issue', cls: 'btn-issue' }
   };
   const FIXED_ROUTES = ['M1','M2','M3','M4','M5','N1','N2','N3','SANDWICH','BMB','INTERNAL','COLLECT'];
 
   let scanner = null;
+  let torchOn = false;
+  let selectedRoute = '';
+  let selectedCustomer = '';
   let currentBatch = null; // { eventType, route, customer, scannedBy, count, recentlyScanned: Map }
-  let knownCustomers = [];
 
   // ---------- role ----------
   function getRole() { return localStorage.getItem(ROLE_KEY) || ''; }
@@ -109,17 +136,22 @@
     localStorage.setItem(ROLE_KEY, role);
     document.getElementById('roleChooser').style.display = 'none';
     updateRolePill();
-    showActionPicker();
+    showRouteCard();
   }
   function chooseRole() {
     stopScanner();
-    document.getElementById('scanCard').style.display = 'none';
-    document.getElementById('setupCard').style.display = 'none';
+    hideAllCards();
     document.getElementById('roleChooser').style.display = 'block';
   }
   function updateRolePill() {
     const r = getRole();
     document.getElementById('rolePill').textContent = r ? ('(' + r + ' — tap to change)') : '(set role)';
+  }
+
+  function hideAllCards() {
+    ['routeCard', 'stopCard', 'actionCard', 'scanCard', 'roleChooser'].forEach(id => {
+      document.getElementById(id).style.display = 'none';
+    });
   }
 
   // ---------- offline queue ----------
@@ -134,23 +166,19 @@
   function flushQueue() {
     const q = getQueue();
     if (!q.length) return;
-    // Send one at a time via GET; keep whatever fails (e.g. still offline) queued for next time
     const remaining = [];
     let chain = Promise.resolve();
     q.forEach(event => {
-      chain = chain
-        .then(() => apiLogScan(event))
-        .catch(() => { remaining.push(event); });
+      chain = chain.then(() => apiLogScan(event)).catch(() => { remaining.push(event); });
     });
     chain.then(() => saveQueue(remaining));
   }
   window.addEventListener('online', flushQueue);
 
   // ---------- API calls ----------
-  // Deliberately GET-only, including for writes: Apps Script web apps respond
-  // via a redirect, and several browsers downgrade a POST to GET when
-  // following it - which would silently mean scans never actually save.
-  // GET has no such issue.
+  // GET-only, including for writes: Apps Script web apps respond via a
+  // redirect, and several browsers downgrade a POST to GET when following
+  // it - which would silently mean scans never actually save. GET avoids this.
   function apiGet(params) {
     const qs = new URLSearchParams(params).toString();
     return fetch(APPS_SCRIPT_URL + '?' + qs).then(r => r.json());
@@ -167,82 +195,109 @@
     });
   }
 
-  // ---------- setup screen ----------
-  function showActionPicker() {
-    document.getElementById('setupCard').style.display = 'block';
-    document.getElementById('scanCard').style.display = 'none';
+  // ============================================================
+  // STEP 1: ROUTE
+  // ============================================================
+  function showRouteCard() {
+    stopScanner();
+    hideAllCards();
+    const select = document.getElementById('routeSelect');
+    select.innerHTML = '';
+    FIXED_ROUTES.forEach(r => {
+      const opt = document.createElement('option'); opt.value = r; opt.textContent = r;
+      select.appendChild(opt);
+    });
+    document.getElementById('routeCard').style.display = 'block';
+  }
+
+  function chooseRoute() {
+    selectedRoute = document.getElementById('routeSelect').value;
+    showStopCard();
+  }
+
+  // ============================================================
+  // STEP 2: STOP (customer) - camera scans STOP markers here too
+  // ============================================================
+  function showStopCard() {
+    stopScanner();
+    hideAllCards();
+    document.getElementById('stopCard').style.display = 'block';
+    document.getElementById('stopRouteLabel').textContent = selectedRoute;
+    document.getElementById('stopCustomerInput').value = '';
+
+    const datalist = document.getElementById('stopCustomerList');
+    datalist.innerHTML = '';
+    apiGet({ action: 'customersForRoute', route: selectedRoute }).then(list => {
+      (list || []).forEach(c => { const o = document.createElement('option'); o.value = c; datalist.appendChild(o); });
+    }).catch(() => {});
+
+    startScanner('reader', onStopScanSuccess);
+  }
+
+  function onStopScanSuccess(decodedText) {
+    const text = decodedText.trim();
+    if (text.indexOf('STOP|') !== 0) {
+      showStatus('err', "That's not a stop marker — scan the QR on the manifest, or type the customer below.");
+      return;
+    }
+    const parts = text.split('|');
+    const stopRoute = parts[1] || '';
+    const stopCustomer = parts[2] || '';
+    if (stopRoute !== selectedRoute) {
+      showStatus('err', 'This marker is for route ' + stopRoute + ', but you selected ' + selectedRoute + '.');
+      return;
+    }
+    selectedCustomer = stopCustomer;
+    hideStatus();
+    showActionCard();
+  }
+
+  function chooseStop() {
+    const val = document.getElementById('stopCustomerInput').value.trim();
+    if (!val) { alert('Enter or pick a customer, or scan the stop marker.'); return; }
+    selectedCustomer = val;
+    showActionCard();
+  }
+
+  // ============================================================
+  // STEP 3: ACTION
+  // ============================================================
+  function showActionCard() {
+    stopScanner();
+    hideAllCards();
+    document.getElementById('actionCard').style.display = 'block';
+    document.getElementById('actionRouteLabel').textContent = selectedRoute;
+    document.getElementById('actionStopLabel').textContent = selectedCustomer;
+
     const role = getRole() || 'ops';
     const actions = ROLE_ACTIONS[role] || ROLE_ACTIONS.ops;
-    const area = document.getElementById('actionPicker');
-    area.innerHTML = '<div>What are you scanning right now?</div>';
-
+    const area = document.getElementById('actionButtons');
+    area.innerHTML = '';
     actions.forEach(actionType => {
       const meta = ACTION_META[actionType];
       const btn = document.createElement('button');
       btn.className = meta.cls;
       btn.textContent = meta.label;
-      btn.onclick = () => (actionType === 'OUT') ? showOutSetupForm() : startBatch(actionType, '', '');
+      btn.onclick = () => startBatch(actionType, selectedRoute, selectedCustomer);
       area.appendChild(btn);
     });
   }
 
-  function showOutSetupForm() {
-    const area = document.getElementById('actionPicker');
-    area.innerHTML = '';
-
-    const routeLabel = document.createElement('label');
-    routeLabel.textContent = 'Route for this batch';
-    area.appendChild(routeLabel);
-    const routeSelect = document.createElement('select');
-    FIXED_ROUTES.forEach(r => {
-      const opt = document.createElement('option'); opt.value = r; opt.textContent = r;
-      routeSelect.appendChild(opt);
-    });
-    area.appendChild(routeSelect);
-
-    const custLabel = document.createElement('label');
-    custLabel.textContent = 'Customer for this batch';
-    area.appendChild(custLabel);
-    const custInput = document.createElement('input');
-    custInput.type = 'text';
-    custInput.setAttribute('list', 'customerList');
-    custInput.placeholder = 'Type or pick a customer';
-    area.appendChild(custInput);
-    const datalist = document.createElement('datalist');
-    datalist.id = 'customerList';
-    knownCustomers.forEach(c => { const o = document.createElement('option'); o.value = c; datalist.appendChild(o); });
-    area.appendChild(datalist);
-
-    const btn = document.createElement('button');
-    btn.className = 'btn-out';
-    btn.textContent = 'Start scanning';
-    btn.onclick = () => {
-      const customer = custInput.value.trim();
-      if (!customer) { alert('Enter a customer name.'); return; }
-      startBatch('OUT', routeSelect.value, customer);
-    };
-    area.appendChild(btn);
-
-    const back = document.createElement('button');
-    back.className = 'btn-secondary';
-    back.textContent = 'Back';
-    back.onclick = showActionPicker;
-    area.appendChild(back);
-  }
-
-  // ---------- batch scanning ----------
+  // ============================================================
+  // STEP 4: SCANNING CRATES
+  // ============================================================
   function startBatch(eventType, route, customer) {
     currentBatch = {
       eventType, route, customer,
       scannedBy: sessionStorage.getItem('scannerName') || promptForName(),
       count: 0,
-      recentlyScanned: new Map() // crateId -> timestamp, to debounce repeat reads of the same sticker
+      recentlyScanned: new Map() // crateId -> timestamp, debounce repeat reads of the same sticker
     };
-    document.getElementById('setupCard').style.display = 'none';
+    hideAllCards();
     document.getElementById('scanCard').style.display = 'block';
     document.getElementById('liveLog').innerHTML = '';
     updateBatchCount();
-    startScanner();
+    startScanner('reader2', onCrateScanSuccess);
   }
 
   function promptForName() {
@@ -253,35 +308,12 @@
 
   function updateBatchCount() {
     const meta = ACTION_META[currentBatch.eventType];
-    let context = '';
-    if (currentBatch.eventType === 'OUT') context = ' — ' + currentBatch.route + ' / ' + currentBatch.customer;
     document.getElementById('batchCount').textContent =
-      meta.label + context + ' — ' + currentBatch.count + ' scanned this batch';
+      'Route ' + currentBatch.route + ' — ' + currentBatch.customer + ' — ' + meta.label +
+      ' — ' + currentBatch.count + ' scanned';
   }
 
-  function startScanner() {
-    showStatus('pending', 'Starting camera…');
-    scanner = new Html5Qrcode("reader");
-    Html5Qrcode.getCameras().then(cameras => {
-      if (!cameras || !cameras.length) throw { message: 'No camera found' };
-      const back = cameras.find(c => /back|rear|environment/i.test(c.label));
-      const cameraId = (back || cameras[cameras.length - 1] || cameras[0]).id;
-      return scanner.start(cameraId, { fps: 10, qrbox: 220 }, onScanSuccess);
-    })
-      .then(() => hideStatus())
-      .catch(err => {
-        showStatus('err', 'Camera error: ' + (err && err.message ? err.message : 'unknown') + ' — use manual entry below.');
-      });
-  }
-
-  function stopScanner() {
-    if (scanner) {
-      scanner.stop().catch(() => {});
-      scanner = null;
-    }
-  }
-
-  function onScanSuccess(decodedText) {
+  function onCrateScanSuccess(decodedText) {
     handleCrateId(decodedText.trim());
   }
 
@@ -293,6 +325,24 @@
 
   function handleCrateId(crateId) {
     if (!currentBatch) return;
+
+    // Re-scanning a stop marker mid-session switches the current stop
+    // without leaving the scanning screen or restarting the batch.
+    if (crateId.indexOf('STOP|') === 0) {
+      const parts = crateId.split('|');
+      const stopRoute = parts[1] || '';
+      const stopCustomer = parts[2] || '';
+      if (stopRoute !== currentBatch.route) {
+        showStatus('err', 'This marker is for route ' + stopRoute + ', but this batch is route ' + currentBatch.route + '.');
+        return;
+      }
+      currentBatch.customer = stopCustomer;
+      updateBatchCount();
+      showStatus('ok', 'Now at: ' + stopCustomer);
+      setTimeout(hideStatus, 1200);
+      return;
+    }
+
     const now = Date.now();
     const last = currentBatch.recentlyScanned.get(crateId);
     if (last && (now - last) < 4000) return; // debounce: ignore the same sticker re-read within 4s
@@ -325,7 +375,6 @@
   function addLogRow(crateId, eventType, state) {
     const row = document.createElement('div');
     row.className = 'row';
-    row.id = 'log-' + crateId.replace(/[^a-zA-Z0-9]/g, '_') + '-' + Date.now();
     row.dataset.crate = crateId;
     row.innerHTML = '<span class="id">' + crateId + '</span><span class="tag tag-' + eventType + '">' + stateLabel(state) + '</span>';
     document.getElementById('liveLog').prepend(row);
@@ -341,7 +390,66 @@
   function finishBatch() {
     stopScanner();
     currentBatch = null;
-    showActionPicker();
+    showStopCard(); // same route, ready for the next customer
+  }
+
+  // ---------- shared camera handling ----------
+  function startScanner(elementId, onSuccess) {
+    showStatus('pending', 'Starting camera…');
+    scanner = new Html5Qrcode(elementId);
+    Html5Qrcode.getCameras().then(cameras => {
+      if (!cameras || !cameras.length) throw { message: 'No camera found' };
+      const back = cameras.find(c => /back|rear|environment/i.test(c.label));
+      const cameraId = (back || cameras[cameras.length - 1] || cameras[0]).id;
+      return scanner.start(cameraId, { fps: 10, qrbox: 220 }, onSuccess);
+    })
+      .then(() => {
+        hideStatus();
+        showFlashButtonIfSupported(elementId);
+      })
+      .catch(err => {
+        showStatus('err', 'Camera error: ' + (err && err.message ? err.message : 'unknown') + ' — use manual entry below.');
+      });
+  }
+
+  function stopScanner() {
+    if (scanner) {
+      scanner.stop().catch(() => {});
+      scanner = null;
+    }
+    torchOn = false;
+    document.getElementById('flashBtnStop').style.display = 'none';
+    document.getElementById('flashBtnScan').style.display = 'none';
+  }
+
+  function showFlashButtonIfSupported(elementId) {
+    const btnId = elementId === 'reader' ? 'flashBtnStop' : 'flashBtnScan';
+    const btn = document.getElementById(btnId);
+    try {
+      const capabilities = scanner.getRunningTrackCapabilities();
+      if (capabilities && capabilities.torch) {
+        btn.style.display = 'block';
+        btn.textContent = 'Turn flash on';
+      } else {
+        btn.style.display = 'none';
+      }
+    } catch (e) {
+      btn.style.display = 'none';
+    }
+  }
+
+  function toggleTorch() {
+    if (!scanner) return;
+    const next = !torchOn;
+    scanner.applyVideoConstraints({ advanced: [{ torch: next }] })
+      .then(() => {
+        torchOn = next;
+        ['flashBtnStop', 'flashBtnScan'].forEach(id => {
+          const btn = document.getElementById(id);
+          if (btn.style.display !== 'none') btn.textContent = torchOn ? 'Turn flash off' : 'Turn flash on';
+        });
+      })
+      .catch(() => showStatus('err', "Couldn't control the flash on this device."));
   }
 
   function showStatus(kind, msg) {
@@ -354,12 +462,11 @@
   }
 
   // ---------- init ----------
-  apiGet({ action: 'customers' }).then(list => { knownCustomers = list || []; }).catch(() => {});
   updateQueueBadge();
   flushQueue();
   updateRolePill();
   if (!getRole()) chooseRole();
-  else showActionPicker();
+  else showRouteCard();
 </script>
 </body>
 </html>
